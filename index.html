@@ -948,7 +948,7 @@
             </div>
 
             <div class="identity-label">Routing Identity (UOR, address, or text)</div>
-            <input type="text" class="identity-input" id="identityInput" placeholder="sha256:... or tenant-alpha" style="margin-bottom:0.75rem;">
+            <input type="text" class="identity-input" id="identityInput" value="tenant-alpha" placeholder="sha256:... or tenant-alpha" style="margin-bottom:0.75rem;">
         </div>
 
         <!-- QIMC Panel -->
@@ -2255,15 +2255,7 @@ async function sendQuery(text) {
     chatLogInner.appendChild(loadMsg);
     scrollToBottom();
 
-    const identity = document.getElementById("identityInput")?.value.trim() || "";
-    if (!identity) {
-        chatLogInner.removeChild(loadMsg);
-        addMessage("model", "Identity is required.");
-        chatInput.disabled = false;
-        sendBtn.disabled = false;
-        chatInput.focus();
-        return;
-    }
+    const identity = document.getElementById("identityInput")?.value.trim() || "tenant-alpha";
     try {
         const resp = await fetch("/api/chat", {
             method: "POST",
