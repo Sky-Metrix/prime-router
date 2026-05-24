@@ -19,6 +19,15 @@ An advanced, interactive world model and visualization dashboard leveraging **Ho
   * **Euclidean Projection**: Flat 2D map of corpus points with glowing resonances and active query trajectories.
   * **Riemannian Hopf Canvas**: 3D stereographic representation of the 4D hypersphere orbital zeta rings ($\gamma_1..\gamma_{16}$), drag to rotate.
 * **Auto-Bootstrap System**: Automatic dependency installations, macOS Ollama app startup, and model preloading directly inside the main script.
+* **UOR Attestation Layer**:
+  * Accepts UOR addresses or plain text identities for routing/QIMC mapping.
+  * Emits deterministic UOR addresses with witness metadata (label, fingerprint, verification result) and multihash address variants.
+  * Includes `/api/uor/verify` for independent address re-verification against canonical payloads.
+  * Includes `/api/uor/capabilities` and `/api/uor/attest` to expose supported hash algorithms and generate attestations for arbitrary payloads.
+* **Identity-Scoped Runtime Core (UOR-enabled)**:
+  * Maintains per-identity hypersphere brain states so sessions do not overwrite each other.
+  * Stores and retrieves identity-scoped conversation corpus shards while preserving shared baseline knowledge.
+  * Exposes scoped map points (`scope`) and system stats (`identity_scopes`, `session_states`) for operations visibility.
 
 ---
 
@@ -52,7 +61,7 @@ You do not need to install dependencies or run boot scripts manually. Simply run
 python3 server.py
 ```
 On startup, `server.py` will automatically:
-1. Verify and auto-install Python dependencies (`numpy`, `psutil`, `opentelemetry`).
+1. Verify and auto-install Python dependencies (`numpy`, `psutil`, `opentelemetry`, `uor-addr`).
 2. Verify if the Ollama service is running (and launch it automatically on macOS).
 3. Verify if the model `gemma4:e2b` is ready (and pull it from the Ollama library if missing).
 4. Load the manifold cache. If the cache is missing or corrupt, it automatically regenerates it from `wiki_corpus.txt` within 20 seconds.
@@ -66,6 +75,53 @@ http://localhost:8000
 To trace queries and print step-by-step state trajectory coordinate values directly in your terminal:
 ```bash
 python3 cli.py
+```
+
+## Strict V&V
+
+Run the strict verification and validation suite:
+
+```bash
+python3 -m unittest -v tests/test_vv_strict.py
+```
+
+The suite validates:
+
+* Conceptual model invariants (identity required, deterministic identity mapping, UOR-first attestation, UOR control-plane routing effects).
+* Function-level contracts for identity profiling, QIMC seeding, routing structure, state isolation, and attestation determinism.
+* HTTP API contracts for `/api/chat`, `/api/uor/capabilities`, `/api/uor/attest`, and `/api/uor/verify`.
+* Multi-algorithm UOR test vectors across `sha256`, `sha3-256`, `blake3`, `keccak256`, and `sha512`.
+* Real-world routing test vectors listed in `tests/vv_test_vectors.json`.
+
+If any invariant fails, the suite exits non-zero and reports the violated contract.
+
+### Integration + End-to-End Coverage
+
+Run the full local test stack (V&V + integration + end-to-end):
+
+```bash
+python3 -m unittest -v \
+  tests/test_vv_strict.py \
+  tests/test_integration_system.py \
+  tests/test_e2e_api_journey.py
+```
+
+### CI Workflow
+
+The repository includes a GitHub Actions workflow at `.github/workflows/ci.yml` that:
+
+* Validates the CI workflow structure with `tests/validate_ci_config.py`.
+* Runs compile checks for core modules and tests.
+* Executes strict V&V, integration, and end-to-end suites.
+
+To run the CI-equivalent checks locally:
+
+```bash
+python3 tests/validate_ci_config.py && \
+python3 -m py_compile server.py cli.py prime_router_package.py \
+  tests/test_vv_strict.py tests/test_integration_system.py tests/test_e2e_api_journey.py && \
+python3 -m unittest -v \
+  tests/test_vv_strict.py tests/test_integration_system.py tests/test_e2e_api_journey.py
 ```
 
 <img width="1432" height="680" alt="1779508477472" src="https://github.com/user-attachments/assets/83ea0d72-df3a-43bd-a8e1-dfbe569fb941" />

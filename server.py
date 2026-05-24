@@ -12,19 +12,30 @@ import random
 import time
 import threading
 import urllib.request
+from itertools import chain
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 # 1. Automatic dependency bootstrap check before numpy import
 try:
     import numpy as np
 except ImportError:
-    print("[*] numpy is not installed. Attempting to install required dependencies (numpy, psutil, opentelemetry)...")
+    print("[*] numpy is not installed. Attempting to install required dependencies (numpy, psutil, opentelemetry, uor-addr)...")
     import subprocess
     try:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "numpy", "psutil", "opentelemetry-api", "opentelemetry-sdk"])
+        subprocess.check_call([
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "numpy",
+            "psutil",
+            "opentelemetry-api",
+            "opentelemetry-sdk",
+            "uor-addr",
+        ])
         print("[+] Dependencies successfully installed.")
     except Exception as e:
         print(f"[-] Failed to automatically install dependencies: {e}")
-        print("[!] Please run: pip3 install numpy psutil opentelemetry-api opentelemetry-sdk")
+        print("[!] Please run: pip3 install numpy psutil opentelemetry-api opentelemetry-sdk uor-addr")
         sys.exit(1)
 
 import numpy as np
@@ -32,6 +43,50 @@ import hashlib
 import unicodedata
 from collections.abc import Sequence
 from functools import lru_cache
+
+# ─── UOR Addressing ──────────────────────────────────────────────────────────
+try:
+    import uor_addr
+except ImportError:
+    print("[-] uor-addr is required for this implementation.")
+    print("[!] Please run: pip3 install uor-addr")
+    sys.exit(1)
+
+SUPPORTED_UOR_HASH_ALGOS = {
+    "sha256": uor_addr.HASH_SHA256,
+    "sha3-256": uor_addr.HASH_SHA3_256,
+    "blake3": uor_addr.HASH_BLAKE3,
+    "keccak256": uor_addr.HASH_KECCAK256,
+    "sha512": uor_addr.HASH_SHA512,
+}
+SUPPORTED_UOR_HASH_ALGO_BY_ID = {algo_id: name for name, algo_id in SUPPORTED_UOR_HASH_ALGOS.items()}
+SUPPORTED_UOR_HASH_ORDER = ("sha256", "sha3-256", "blake3", "keccak256", "sha512")
+
+def normalize_uor_hash_algorithm(algo: str | int | None, default: str = "sha256") -> tuple[str, int]:
+    default_name = default if default in SUPPORTED_UOR_HASH_ALGOS else "sha256"
+    if algo is None:
+        return default_name, SUPPORTED_UOR_HASH_ALGOS[default_name]
+
+    if isinstance(algo, int):
+        if algo in SUPPORTED_UOR_HASH_ALGO_BY_ID:
+            name = SUPPORTED_UOR_HASH_ALGO_BY_ID[algo]
+            return name, algo
+        raise ValueError(f"unsupported uor hash algorithm id: {algo}")
+
+    normalized = str(algo).strip().lower().replace("_", "-")
+    if normalized in SUPPORTED_UOR_HASH_ALGOS:
+        return normalized, SUPPORTED_UOR_HASH_ALGOS[normalized]
+    raise ValueError(f"unsupported uor hash algorithm: {algo}")
+
+def compute_multihash_json_addresses(canonical_json_bytes: bytes) -> dict[str, str]:
+    addresses = {}
+    for name in SUPPORTED_UOR_HASH_ORDER:
+        algo_id = SUPPORTED_UOR_HASH_ALGOS[name]
+        try:
+            addresses[name] = uor_addr.kappa.json_address_with_hash(canonical_json_bytes, algo_id)
+        except Exception:
+            continue
+    return addresses
 
 # ─── OpenTelemetry ────────────────────────────────────────────────────────────
 try:
@@ -146,7 +201,7 @@ except ImportError as e:
     sys.exit(1)
 
 # ============================================================
-# QIMC, Hopf, and UOF Scalar Helpers
+# QIMC, Hopf, and UOR Scalar Helpers
 # ============================================================
 def _wrap_to_pi(theta: float) -> float:
     return (theta + math.pi) % (2.0 * math.pi) - math.pi
@@ -283,25 +338,135 @@ def get_primes_6k_plus_1(count):
     return primes
 
 PRIMES_6K = get_primes_6k_plus_1(512)
+RESERVED_SHARED_IDENTITY = "__shared__"
 
-def normalize_mac(mac_str):
-    clean = "".join(c for c in mac_str if c.isalnum()).lower()
-    if len(clean) == 12:
-        return ":".join(clean[i:i+2] for i in range(0, 12, 2))
-    return mac_str.strip().lower()
+def normalize_identity(identity_str):
+    raw = str(identity_str or "").strip()
+    if not raw:
+        raise ValueError("identity is required")
 
-def mac_to_qimc_prime(mac_str):
-    normalized = normalize_mac(mac_str)
-    clean = "".join(c for c in normalized if c.isalnum())
-    if len(clean) == 12:
-        try:
-            val = int(clean, 16)
-        except ValueError:
-            val = int(hashlib.sha256(normalized.encode('utf-8')).hexdigest()[:12], 16)
-    else:
-        val = int(hashlib.sha256(normalized.encode('utf-8')).hexdigest()[:12], 16)
+    lowered = raw.lower()
+    if lowered == RESERVED_SHARED_IDENTITY:
+        return "shared", lowered
+
+    if ":" in lowered and lowered.split(":", 1)[0] in SUPPORTED_UOR_HASH_ALGOS:
+        return "uor", lowered
+
+    return "text", lowered
+
+def identity_key(identity_str) -> str:
+    identity_type, normalized = normalize_identity(identity_str)
+    return f"{identity_type}:{normalized}"
+
+@lru_cache(maxsize=4096)
+def identity_to_uor_digest(identity_str: str) -> tuple[str, str]:
+    _, normalized = normalize_identity(identity_str)
+    canonical_identity = json.dumps(normalized, ensure_ascii=False)
+    addr = uor_addr.kappa.json_address_with_hash(canonical_identity.encode("utf-8"), SUPPORTED_UOR_HASH_ALGOS["sha256"])
+    digest = addr.split(":", 1)[1] if ":" in addr else ""
+    if not (digest and all(c in "0123456789abcdef" for c in digest)):
+        raise ValueError("uor-addr returned an invalid SHA-256 address")
+    return addr, digest
+
+@lru_cache(maxsize=4096)
+def identity_to_uor_profile(identity_str: str) -> dict:
+    identity_type, normalized = normalize_identity(identity_str)
+    canonical_identity = json.dumps(normalized, ensure_ascii=False).encode("utf-8")
+
+    if identity_type == "uor":
+        algo_name = normalized.split(":", 1)[0]
+        digest = normalized.split(":", 1)[1] if ":" in normalized else ""
+        if not (digest and all(c in "0123456789abcdef" for c in digest)):
+            raise ValueError("invalid uor identity digest")
+        return {
+            "identity_type": identity_type,
+            "identity_uor_address": normalized,
+            "identity_uor_digest": digest,
+            "identity_uor_hash_algorithm": algo_name,
+            "identity_uor_multihash": {algo_name: normalized},
+        }
+
+    addresses = compute_multihash_json_addresses(canonical_identity)
+    primary = addresses.get("sha256")
+    if not primary:
+        raise ValueError("failed to derive identity sha256 uor address")
+    digest = primary.split(":", 1)[1] if ":" in primary else ""
+    if not digest:
+        raise ValueError("failed to derive identity digest")
+    return {
+        "identity_type": identity_type,
+        "identity_uor_address": primary,
+        "identity_uor_digest": digest,
+        "identity_uor_hash_algorithm": "sha256",
+        "identity_uor_multihash": addresses,
+    }
+
+def identity_to_qimc_prime(identity_str):
+    identity_type, normalized = normalize_identity(identity_str)
+    uor_profile = identity_to_uor_profile(normalized)
+
+    digest = uor_profile["identity_uor_digest"]
+    uor_identity_address = uor_profile["identity_uor_address"]
+
+    val = int(digest[:12], 16)
+
     idx = (val % 500) + 1
-    return PRIMES_6K[idx - 1], idx
+    return PRIMES_6K[idx - 1], idx, {
+        "identity": normalized,
+        "identity_type": identity_type,
+        "identity_uor_address": uor_identity_address,
+        "identity_uor_digest": digest,
+        "identity_uor_hash_algorithm": uor_profile["identity_uor_hash_algorithm"],
+        "identity_uor_multihash": uor_profile["identity_uor_multihash"],
+    }
+
+def _digest_to_bytes(hex_digest: str) -> bytes:
+    clean = (hex_digest or "").strip().lower()
+    if len(clean) % 2 != 0:
+        clean = "0" + clean
+    if not clean or any(c not in "0123456789abcdef" for c in clean):
+        return b""
+    try:
+        return bytes.fromhex(clean)
+    except Exception:
+        return b""
+
+def derive_uor_control_plane(identity_meta: dict) -> dict:
+    multihash = identity_meta.get("identity_uor_multihash") or {}
+    digest_bytes = []
+    for algo in SUPPORTED_UOR_HASH_ORDER:
+        addr = multihash.get(algo, "")
+        digest = addr.split(":", 1)[1] if ":" in addr else ""
+        db = _digest_to_bytes(digest)
+        if db:
+            digest_bytes.append(db)
+
+    primary_digest = identity_meta.get("identity_uor_digest", "")
+    primary_bytes = _digest_to_bytes(primary_digest)
+    if not digest_bytes and primary_bytes:
+        digest_bytes = [primary_bytes]
+    if not digest_bytes:
+        digest_bytes = [bytes([0] * 32)]
+
+    first_bytes = [db[0] for db in digest_bytes if len(db) > 0]
+    entropy_bias = (sum(first_bytes) / len(first_bytes)) / 255.0 if first_bytes else 0.5
+    phase_transport_lambda = 0.70 + (0.60 * entropy_bias)
+    hopf_chi_bins = 2 + int(entropy_bias * 3.0)
+    hopf_chi_bins = max(2, min(4, hopf_chi_bins))
+
+    identity_window_bias = {}
+    for window in range(1, 17):
+        src = digest_bytes[(window - 1) % len(digest_bytes)]
+        b = src[(window * 3) % len(src)]
+        centered = (float(b) / 255.0) - 0.5
+        identity_window_bias[window] = centered * 0.04
+
+    return {
+        "entropy_bias": float(entropy_bias),
+        "phase_transport_lambda": float(phase_transport_lambda),
+        "hopf_chi_bins": int(hopf_chi_bins),
+        "identity_window_bias": identity_window_bias,
+    }
 
 def jcs_canonical_serialize(obj):
     if isinstance(obj, dict):
@@ -312,6 +477,8 @@ def jcs_canonical_serialize(obj):
             val_serialized = jcs_canonical_serialize(val)
             items.append(f'"{k_norm}":{val_serialized}')
         return "{" + ",".join(items) + "}"
+    elif isinstance(obj, (list, tuple)):
+        return "[" + ",".join(jcs_canonical_serialize(item) for item in obj) + "]"
     elif isinstance(obj, str):
         val_norm = unicodedata.normalize('NFC', obj)
         return json.dumps(val_norm)
@@ -332,10 +499,41 @@ def jcs_canonical_serialize(obj):
     else:
         raise TypeError(f"Unsupported type: {type(obj)}")
 
-def generate_uof_hash(payload):
-    canonical = jcs_canonical_serialize(payload)
-    h = hashlib.sha256(canonical.encode('utf-8')).hexdigest()
-    return f"sha256:{h}"
+def generate_uor_attestation(payload, hash_algorithm: str | int = "sha256", include_multihash: bool = True):
+    hash_name, hash_id = normalize_uor_hash_algorithm(hash_algorithm, default="sha256")
+    canonical = jcs_canonical_serialize(payload).encode("utf-8")
+    address = uor_addr.kappa.json_address_with_hash(canonical, hash_id)
+    kappa_label = ""
+    fingerprint_hex = ""
+    verify_result = ""
+
+    multihash_addresses = compute_multihash_json_addresses(canonical) if include_multihash else {}
+
+    grounded = None
+    try:
+        grounded = uor_addr.kappa.json_address_with_witness_hash(canonical, hash_id)
+        kappa_label = grounded.kappa_label()
+        fingerprint_hex = grounded.content_fingerprint().hex()
+        verify_result = grounded.verify()
+    except Exception:
+        verify_result = "witness-unavailable"
+    finally:
+        if grounded is not None:
+            try:
+                grounded.close()
+            except Exception:
+                pass
+
+    return {
+        "algorithm": hash_name,
+        "hash_algorithm": hash_name,
+        "hash_algorithm_id": int(hash_id),
+        "address": address,
+        "kappa_label": kappa_label,
+        "fingerprint_hex": fingerprint_hex,
+        "verify_result": verify_result,
+        "multihash_addresses": multihash_addresses,
+    }
 
 # Pre-load data and table
 print("[*] Pre-loading mathematical tables for server boot...")
@@ -347,15 +545,41 @@ print("[+] Mathematical tables loaded. Server ready.")
 # Hypersphere brain state
 print("[*] Initializing persistent 512D session brain state...")
 SESSION_BRAIN_STATE = np.ones(M_MAX) / math.sqrt(M_MAX)
+SESSION_BRAIN_STATES = {}
 
-def reset_brain_state():
-    global SESSION_BRAIN_STATE
-    SESSION_BRAIN_STATE = np.ones(M_MAX) / math.sqrt(M_MAX)
-    print("[+] Hypersphere brain state reset to baseline.")
+def get_brain_state(identity: str | None = None) -> np.ndarray:
+    global SESSION_BRAIN_STATE, SESSION_BRAIN_STATES
+    if identity is None or identity == RESERVED_SHARED_IDENTITY:
+        return SESSION_BRAIN_STATE
+    key = identity_key(identity)
+    if key not in SESSION_BRAIN_STATES:
+        SESSION_BRAIN_STATES[key] = np.copy(SESSION_BRAIN_STATE)
+    return SESSION_BRAIN_STATES[key]
 
-def evolve_brain_state(query_text: str, gamma: float = 0.5) -> np.ndarray:
+def set_brain_state(identity: str | None, state_vector: np.ndarray):
+    global SESSION_BRAIN_STATE, SESSION_BRAIN_STATES
+    if identity is None or identity == RESERVED_SHARED_IDENTITY:
+        SESSION_BRAIN_STATE = state_vector
+        return
+    key = identity_key(identity)
+    SESSION_BRAIN_STATES[key] = state_vector
+
+def reset_brain_state(identity: str | None = None):
+    global SESSION_BRAIN_STATE, SESSION_BRAIN_STATES
+    baseline = np.ones(M_MAX) / math.sqrt(M_MAX)
+    if identity is None:
+        SESSION_BRAIN_STATE = baseline
+        SESSION_BRAIN_STATES = {}
+        print("[+] Hypersphere brain states reset to baseline for all identities.")
+    else:
+        key = identity_key(identity)
+        SESSION_BRAIN_STATES[key] = np.copy(baseline)
+        print(f"[+] Hypersphere brain state reset to baseline for {key}.")
+
+def evolve_brain_state(query_text: str, gamma: float = 0.5, identity: str | None = None) -> np.ndarray:
     global SESSION_BRAIN_STATE, VOCAB_VECTORS
     words = [w.lower().strip(".,?!()\"';:-") for w in query_text.split() if w.strip()]
+    active_state = np.copy(get_brain_state(identity))
     S = np.zeros(M_MAX)
     word_count = 0
     for w in words:
@@ -367,12 +591,13 @@ def evolve_brain_state(query_text: str, gamma: float = 0.5) -> np.ndarray:
         S_norm = np.linalg.norm(S)
         if S_norm > 0:
             S = S / S_norm
-        H_new = gamma * SESSION_BRAIN_STATE + (1.0 - gamma) * S
+        H_new = gamma * active_state + (1.0 - gamma) * S
         H_norm = np.linalg.norm(H_new)
         if H_norm > 0:
-            SESSION_BRAIN_STATE = H_new / H_norm
-            
-    return SESSION_BRAIN_STATE
+            active_state = H_new / H_norm
+
+    set_brain_state(identity, active_state)
+    return active_state
 
 # Define the grid of scales x
 X_GRID = np.exp(np.linspace(math.log(X_MIN), math.log(X_MAX), NUM_WINDOWS))
@@ -438,6 +663,25 @@ Ask me about the Gambia borehole locations, or how the R4 routing replaces trans
 # Global database of indexed sentences on the manifold
 # Key: scale window index, Value: list of dictionaries
 CORPUS_INDEX = {}
+CORPUS_INDEX_BY_ID = {}
+
+def get_corpus_index_for_identity(identity: str | None = None) -> dict:
+    global CORPUS_INDEX, CORPUS_INDEX_BY_ID
+    if identity is None or identity == RESERVED_SHARED_IDENTITY:
+        return CORPUS_INDEX
+    key = identity_key(identity)
+    if key not in CORPUS_INDEX_BY_ID:
+        CORPUS_INDEX_BY_ID[key] = {}
+    return CORPUS_INDEX_BY_ID[key]
+
+def count_indexed_sentences(index_store: dict) -> int:
+    return sum(len(items) for items in index_store.values())
+
+def aggregate_indexed_sentences() -> int:
+    total = count_indexed_sentences(CORPUS_INDEX)
+    for scoped in CORPUS_INDEX_BY_ID.values():
+        total += count_indexed_sentences(scoped)
+    return total
 
 # Global vocabulary databases for auto-regressive next-token generation
 VOCABULARY = []
@@ -489,15 +733,18 @@ def get_sentence_prime_product(words: list[str]) -> int:
         prod *= WORD_PRIMES[w]
     return prod
 
-def find_most_resonant_sentence(query_text: str, query_state: np.ndarray) -> dict:
+def find_most_resonant_sentence(query_text: str, query_state: np.ndarray, identity: str | None = None) -> dict:
     query_words = [w.lower().strip(".,?!()\"';:-") for w in query_text.split() if w.strip()]
     query_primes = [WORD_PRIMES[w] for w in query_words if w in WORD_PRIMES and w not in QUERY_STOPWORDS]
     
     best_item = None
     best_score = -1.0
     
-    for win_idx, items in CORPUS_INDEX.items():
-        for item in items:
+    scoped_index = get_corpus_index_for_identity(identity) if identity is not None else {}
+    all_windows = set(CORPUS_INDEX.keys()) | set(scoped_index.keys())
+
+    for win_idx in all_windows:
+        for item in chain(CORPUS_INDEX.get(win_idx, []), scoped_index.get(win_idx, [])):
             shared_count = 0
             s_prod = item.get("prime_product") or get_sentence_prime_product(item.get("words") or [w.lower().strip(".,?!()\"';:-") for w in item["sentence"].split() if w.strip()])
             for p in query_primes:
@@ -805,12 +1052,14 @@ def generate_geometric_response(prompt_text, S, max_len=30, gravity=10.0, temp=0
         
     return " ".join(generated)
 
-def generate_geometric_response_with_trajectory(prompt_text, S, max_len=30, gravity=10.0, temp=0.25, freq_penalty=4.0, mac="00:00:00:00:00:00", gamma=0.5):
+def generate_geometric_response_with_trajectory(prompt_text, S, max_len=30, gravity=10.0, temp=0.25, freq_penalty=4.0, identity: str = "", gamma=0.5):
     """
     Dynamically decodes a new path through the language torus and records
     the manifold routing state at each token step. Uses hybrid GCD-concept steering,
     tracks advanced quantum metrics, and dynamically evolves the state vector along geodesics.
     """
+    if not identity:
+        raise ValueError("identity is required")
     words = [w.lower().strip(".,?!()\"';:-") for w in prompt_text.split() if w.strip()]
     
     # 1. Establish start sequence
@@ -901,7 +1150,7 @@ def generate_geometric_response_with_trajectory(prompt_text, S, max_len=30, grav
                     next_word = candidates[np.argmax(scores_exp)]
                     
         # Route using the current S_local (before evolving it for the next step)
-        r_data = route_query_to_manifold("", include_eigenvalues=False, mac=mac, state_vector=S_local)
+        r_data = route_query_to_manifold("", include_eigenvalues=False, identity=identity, state_vector=S_local)
         routed = r_data["routed"]
         
         # Extract active state slice and binarize
@@ -985,7 +1234,6 @@ def generate_geometric_response_with_trajectory(prompt_text, S, max_len=30, grav
             "sigma_kl": float(routed["metrics"]["sigma_kl"]),
             "qimc": routed.get("qimc"),
             "hopf": routed.get("hopf"),
-            "uof_hash": routed.get("uof_hash"),
             "r4_projection": r4_proj,
             "quantum": {
                 "stratum": stratum,
@@ -1012,14 +1260,13 @@ def generate_geometric_response_with_trajectory(prompt_text, S, max_len=30, grav
         
     return " ".join(generated), trajectory, S_local
 
-def retrieve_geometric_resonance(prompt_text, routing_data, top_n=3, state_vector: np.ndarray = None):
+def retrieve_geometric_resonance(prompt_text, routing_data, top_n=3, state_vector: np.ndarray = None, identity: str | None = None):
     """
     Finds the sentences in the corpus that have the highest topological
     resonance (cosine similarity multiplied by local slice energy) and prime factor matches.
     """
-    global SESSION_BRAIN_STATE
     if state_vector is None:
-        state_vector = SESSION_BRAIN_STATE
+        state_vector = get_brain_state(identity)
         
     words = [w.lower().strip(".,?!()\"';:-") for w in prompt_text.split() if w.strip()]
     query_primes = [WORD_PRIMES[w] for w in words if w in WORD_PRIMES and w not in QUERY_STOPWORDS]
@@ -1035,7 +1282,20 @@ def retrieve_geometric_resonance(prompt_text, routing_data, top_n=3, state_vecto
         query_projections[win_idx] = state_vec
         
     scored = []
-    for win_idx, items in CORPUS_INDEX.items():
+    scoped_index = get_corpus_index_for_identity(identity) if identity is not None else {}
+    all_windows = set(CORPUS_INDEX.keys()) | set(scoped_index.keys())
+
+    for win_idx in all_windows:
+        shared_items = CORPUS_INDEX.get(win_idx, [])
+        scoped_items = scoped_index.get(win_idx, [])
+        if not shared_items and not scoped_items:
+            continue
+
+        merged_items = chain(
+            ((item, 0.0) for item in shared_items),
+            ((item, 15.0) for item in scoped_items),
+        )
+
         win = PRECOMPUTED_WINDOWS[win_idx - 1]
         s_idx = win["s_idx"]
         e_idx = win["e_idx"]
@@ -1045,7 +1305,7 @@ def retrieve_geometric_resonance(prompt_text, routing_data, top_n=3, state_vecto
         if q_vec is None:
             continue
             
-        for item in items:
+        for item, scope_boost in merged_items:
             shared_count = 0
             s_prod = item.get("prime_product") or get_sentence_prime_product(item.get("words") or [w.lower().strip(".,?!()\"';:-") for w in item["sentence"].split() if w.strip()])
             for p in query_primes:
@@ -1055,7 +1315,7 @@ def retrieve_geometric_resonance(prompt_text, routing_data, top_n=3, state_vecto
             sim = cosine_similarity(q_vec, item["state_vector"])
             # Hybrid score: prime factor matches take precedence (multiplied by 100),
             # then sub-ranked by geometric cosine resonance
-            relevance = shared_count * 100.0 + (sim * slice_norm)
+            relevance = shared_count * 100.0 + (sim * slice_norm) + scope_boost
             scored.append((item["sentence"], relevance, win_idx, item["kappa"], item["deficit_angle"]))
             
     scored.sort(key=lambda x: x[1], reverse=True)
@@ -1098,7 +1358,7 @@ def index_corpus(corpus_text: str):
             print(f"    - Indexing progress: {idx}/{len(sentences)} sentences...")
         try:
             # Evaluate routing parameters for sentence
-            routing_data = route_query_to_manifold(s)
+            routing_data = route_query_to_manifold(s, identity=RESERVED_SHARED_IDENTITY)
             best = routing_data["routed"]
             idx_win = best["window_index"]
             
@@ -1193,9 +1453,69 @@ def load_and_apply_glove():
 
 CACHE_WRITE_LOCK = threading.Lock()
 
+def _serialize_corpus_index(index_store: dict) -> dict:
+    serializable = {}
+    for idx, items in index_store.items():
+        serializable_items = []
+        for item in items:
+            state_vector = item["state_vector"]
+            state_np = state_vector if isinstance(state_vector, np.ndarray) else np.array(state_vector)
+            sent_words = item.get("words") or [w.lower().strip(".,?!()\"';:-") for w in item["sentence"].split() if w.strip()]
+            prime_product = int(item["prime_product"]) if "prime_product" in item else get_sentence_prime_product(sent_words)
+            serializable_items.append({
+                "sentence": item["sentence"],
+                "state_vector": state_np.tolist(),
+                "kappa": float(item["kappa"]),
+                "deficit_angle": float(item["deficit_angle"]),
+                "prime_product": prime_product,
+                "words": sent_words,
+                "u": float(item["u"]) if "u" in item else get_sentence_projection(state_np, int(idx))[0],
+                "v": float(item["v"]) if "v" in item else get_sentence_projection(state_np, int(idx))[1],
+                "v_4d": item.get("v_4d") or get_state_4d_projection(state_np)
+            })
+        serializable[idx] = serializable_items
+    return serializable
+
+def _deserialize_corpus_index(index_data: dict) -> dict:
+    deserialized = {}
+    for idx_str, items in index_data.items():
+        idx = int(idx_str)
+        deserialized_items = []
+        for item in items:
+            sent_words = item.get("words")
+            if sent_words is None:
+                sent_words = [w.lower().strip(".,?!()\"';:-") for w in item["sentence"].split() if w.strip()]
+            prime_prod = item.get("prime_product")
+            if prime_prod is None:
+                prime_prod = get_sentence_prime_product(sent_words)
+
+            state_vector = np.array(item["state_vector"])
+            u = item.get("u")
+            v = item.get("v")
+            if u is None or v is None:
+                u, v = get_sentence_projection(state_vector, idx)
+
+            v_4d = item.get("v_4d")
+            if v_4d is None:
+                v_4d = get_state_4d_projection(state_vector)
+
+            deserialized_items.append({
+                "sentence": item["sentence"],
+                "state_vector": state_vector,
+                "kappa": float(item["kappa"]),
+                "deficit_angle": float(item["deficit_angle"]),
+                "prime_product": prime_prod,
+                "words": sent_words,
+                "u": u,
+                "v": v,
+                "v_4d": v_4d
+            })
+        deserialized[idx] = deserialized_items
+    return deserialized
+
 def save_manifold_cache(filepath: str):
     """Serializes and saves the indexed vocabulary, transitions, and corpus index to disk atomically."""
-    global VOCABULARY, WORD_PRIMES, VOCAB_VECTORS, TRANSITIONS, CORPUS_INDEX, TRANSITIONS_2ND
+    global VOCABULARY, WORD_PRIMES, VOCAB_VECTORS, TRANSITIONS, CORPUS_INDEX, CORPUS_INDEX_BY_ID, TRANSITIONS_2ND, SESSION_BRAIN_STATES
     
     # Ensure only one thread writes to cache file at a time.
     # If another write is already running, skip this request as the subsequent state will write later.
@@ -1208,22 +1528,15 @@ def save_manifold_cache(filepath: str):
         # Convert numpy arrays to lists for JSON
         serializable_vocab_vectors = {w: v.tolist() for w, v in VOCAB_VECTORS.items()}
         
-        serializable_corpus_index = {}
-        for idx, items in CORPUS_INDEX.items():
-            serializable_items = []
-            for item in items:
-                serializable_items.append({
-                    "sentence": item["sentence"],
-                    "state_vector": item["state_vector"].tolist() if isinstance(item["state_vector"], np.ndarray) else item["state_vector"],
-                    "kappa": float(item["kappa"]),
-                    "deficit_angle": float(item["deficit_angle"]),
-                    "prime_product": int(item["prime_product"]) if "prime_product" in item else get_sentence_prime_product(item.get("words") or [w.lower().strip(".,?!()\"';:-") for w in item["sentence"].split() if w.strip()]),
-                    "words": item.get("words") or [w.lower().strip(".,?!()\"';:-") for w in item["sentence"].split() if w.strip()],
-                    "u": float(item["u"]) if "u" in item else get_sentence_projection(item["state_vector"] if isinstance(item["state_vector"], np.ndarray) else np.array(item["state_vector"]), int(idx))[0],
-                    "v": float(item["v"]) if "v" in item else get_sentence_projection(item["state_vector"] if isinstance(item["state_vector"], np.ndarray) else np.array(item["state_vector"]), int(idx))[1],
-                    "v_4d": item.get("v_4d") or get_state_4d_projection(item["state_vector"] if isinstance(item["state_vector"], np.ndarray) else np.array(item["state_vector"]))
-                })
-            serializable_corpus_index[idx] = serializable_items
+        serializable_corpus_index = _serialize_corpus_index(CORPUS_INDEX)
+        serializable_corpus_index_by_id = {
+            key: _serialize_corpus_index(index_store)
+            for key, index_store in CORPUS_INDEX_BY_ID.items()
+        }
+        serializable_brain_states = {
+            key: state.tolist()
+            for key, state in SESSION_BRAIN_STATES.items()
+        }
             
         cache_data = {
             "vocabulary": VOCABULARY,
@@ -1231,7 +1544,9 @@ def save_manifold_cache(filepath: str):
             "vocab_vectors": serializable_vocab_vectors,
             "transitions": TRANSITIONS,
             "transitions_2nd": TRANSITIONS_2ND,
-            "corpus_index": serializable_corpus_index
+            "corpus_index": serializable_corpus_index,
+            "corpus_index_by_identity": serializable_corpus_index_by_id,
+            "session_brain_states": serializable_brain_states,
         }
         
         with open(tmp_filepath, "w", encoding="utf-8") as f:
@@ -1291,7 +1606,7 @@ def build_transitions_2nd_by_first():
 
 def load_manifold_cache(filepath: str) -> bool:
     """Loads and deserializes the vocabulary, transitions, and corpus index from disk."""
-    global VOCABULARY, WORD_PRIMES, VOCAB_VECTORS, TRANSITIONS, CORPUS_INDEX, TRANSITIONS_2ND
+    global VOCABULARY, WORD_PRIMES, VOCAB_VECTORS, TRANSITIONS, CORPUS_INDEX, CORPUS_INDEX_BY_ID, TRANSITIONS_2ND, SESSION_BRAIN_STATES
     if not os.path.exists(filepath):
         return False
         
@@ -1308,43 +1623,17 @@ def load_manifold_cache(filepath: str) -> bool:
         TRANSITIONS = cache_data["transitions"]
         TRANSITIONS_2ND = cache_data.get("transitions_2nd", {})
         
-        # Convert corpus index keys to integers and state vectors back to numpy arrays
-        CORPUS_INDEX = {}
-        for idx_str, items in cache_data["corpus_index"].items():
-            idx = int(idx_str)
-            deserialized_items = []
-            for item in items:
-                sent_words = item.get("words")
-                if sent_words is None:
-                    sent_words = [w.lower().strip(".,?!()\"';:-") for w in item["sentence"].split() if w.strip()]
-                prime_prod = item.get("prime_product")
-                if prime_prod is None:
-                    prime_prod = get_sentence_prime_product(sent_words)
-                    
-                state_vector = np.array(item["state_vector"])
-                u = item.get("u")
-                v = item.get("v")
-                if u is None or v is None:
-                    u, v = get_sentence_projection(state_vector, idx)
-                    
-                v_4d = item.get("v_4d")
-                if v_4d is None:
-                    v_4d = get_state_4d_projection(state_vector)
-                    
-                deserialized_items.append({
-                    "sentence": item["sentence"],
-                    "state_vector": state_vector,
-                    "kappa": float(item["kappa"]),
-                    "deficit_angle": float(item["deficit_angle"]),
-                    "prime_product": prime_prod,
-                    "words": sent_words,
-                    "u": u,
-                    "v": v,
-                    "v_4d": v_4d
-                })
-            CORPUS_INDEX[idx] = deserialized_items
-            
-        print(f"[+] Successfully loaded {len(VOCABULARY)} vocab dimensions and {sum(len(items) for items in CORPUS_INDEX.values())} indexed sentences from cache.")
+        CORPUS_INDEX = _deserialize_corpus_index(cache_data["corpus_index"])
+        CORPUS_INDEX_BY_ID = {}
+        for key, index_data in cache_data.get("corpus_index_by_identity", {}).items():
+            CORPUS_INDEX_BY_ID[key] = _deserialize_corpus_index(index_data)
+
+        SESSION_BRAIN_STATES = {
+            key: np.array(vec)
+            for key, vec in cache_data.get("session_brain_states", {}).items()
+        }
+
+        print(f"[+] Successfully loaded {len(VOCABULARY)} vocab dimensions and {aggregate_indexed_sentences()} indexed sentences from cache.")
         load_and_apply_glove()
         
         if not TRANSITIONS_2ND:
@@ -1425,14 +1714,13 @@ def text_to_signal_for_x(text: str, x: float) -> tuple:
     y = text_to_signal_for_x_precomputed_S(S, word_count, text, x)
     return xx, y, t_grid
 
-def route_query_to_manifold(text: str, include_eigenvalues: bool = False, mac: str = "00:00:00:00:00:00", state_vector: np.ndarray = None) -> dict:
+def route_query_to_manifold(text: str, include_eigenvalues: bool = False, identity: str | None = None, state_vector: np.ndarray = None) -> dict:
     """
     Routes a given query string or state vector to the R4 manifold by:
     1. Converting it to a sparse signal wave y.
     2. Projecting it onto each scale window's orthonormal basis Q.
     3. Finding the window where the projection has the highest raw energy (slice norm).
     """
-    global SESSION_BRAIN_STATE
     if state_vector is not None:
         S = state_vector
         word_count = 1
@@ -1446,6 +1734,12 @@ def route_query_to_manifold(text: str, include_eigenvalues: bool = False, mac: s
                 S += VOCAB_VECTORS[w]
                 word_count += 1
             
+    if identity is None:
+        raise ValueError("identity is required")
+    identity_value = identity
+    qimc_prime, qimc_index, identity_meta = identity_to_qimc_prime(identity_value)
+    uor_control = derive_uor_control_plane(identity_meta)
+
     candidates = []
     fallback_chars = text if text else "prime"
     
@@ -1475,16 +1769,19 @@ def route_query_to_manifold(text: str, include_eigenvalues: bool = False, mac: s
             
         a_sparse = np.real(Q.conj().T @ y)
         norm = np.linalg.norm(a_sparse)
-        candidates.append((idx, win, a_sparse, norm, y))
+        window_id = idx + 1
+        bias = uor_control["identity_window_bias"].get(window_id, 0.0)
+        score = norm * (1.0 + bias)
+        candidates.append((idx, win, a_sparse, norm, y, score))
         
     best_candidate_idx = 0
-    best_norm = -1.0
-    for idx, (win_idx, win, a_sparse, norm, y) in enumerate(candidates):
-        if norm > best_norm:
-            best_norm = norm
+    best_score = -1.0
+    for idx, (win_idx, win, a_sparse, norm, y, score) in enumerate(candidates):
+        if score > best_score:
+            best_score = score
             best_candidate_idx = idx
             
-    best_idx, best_win, best_state_slice, _, best_y = candidates[best_candidate_idx]
+    best_idx, best_win, best_state_slice, _, best_y, _ = candidates[best_candidate_idx]
     
     best_state = np.zeros(M_MAX)
     best_state[best_win["s_idx"]:best_win["e_idx"]] = best_state_slice
@@ -1515,18 +1812,29 @@ def route_query_to_manifold(text: str, include_eigenvalues: bool = False, mac: s
         denom = 1.0
     v_4d = [w_act/denom, w_obj/denom, w_temp/denom, w_shared/denom]
     
-    hopf_data = assign_sector_hopf_transport_scalar(v_4d, K=512, phase_transport_lambda=1.0, hopf_chi_bins=2)
-    qimc_prime, qimc_index = mac_to_qimc_prime(mac)
-    
-    uof_payload = {
-        "mac": normalize_mac(mac),
+    phase_transport_lambda = uor_control["phase_transport_lambda"]
+    hopf_data = assign_sector_hopf_transport_scalar(
+        v_4d,
+        K=512,
+        phase_transport_lambda=phase_transport_lambda,
+        hopf_chi_bins=uor_control["hopf_chi_bins"],
+    )
+
+    uor_payload = {
+        "identity": identity_meta["identity"],
+        "identity_type": identity_meta["identity_type"],
+        "identity_uor_address": identity_meta["identity_uor_address"],
+        "identity_uor_digest": identity_meta["identity_uor_digest"],
+        "identity_uor_hash_algorithm": identity_meta["identity_uor_hash_algorithm"],
+        "uor_entropy_bias": float(uor_control["entropy_bias"]),
         "window_index": best_idx + 1,
         "scale_x": float(best_win["x"]),
         "kappa": float(best_metrics["kappa"]),
         "deficit_angle": float(best_metrics["deficit_angle"]),
         "hopf_sector": int(hopf_data["sector_id"])
     }
-    best_uof_hash = generate_uof_hash(uof_payload)
+    uor_attestation = generate_uor_attestation(uor_payload)
+    best_uor_address = uor_attestation.get("address", "")
     
     if include_eigenvalues:
         coeffs = []
@@ -1552,7 +1860,16 @@ def route_query_to_manifold(text: str, include_eigenvalues: bool = False, mac: s
         "active_range": [int(best_win["s_idx"]), int(best_win["e_idx"])],
         "state_vector": best_state_slice.tolist(),
         "qimc": {
-            "mac": normalize_mac(mac),
+            "identity": identity_meta["identity"],
+            "identity_type": identity_meta["identity_type"],
+            "identity_uor_address": identity_meta["identity_uor_address"],
+            "identity_uor_digest": identity_meta["identity_uor_digest"],
+            "identity_uor_hash_algorithm": identity_meta["identity_uor_hash_algorithm"],
+            "identity_uor_multihash": identity_meta["identity_uor_multihash"],
+            "uor_control": {
+                "entropy_bias": float(uor_control["entropy_bias"]),
+                "hopf_chi_bins": int(uor_control["hopf_chi_bins"]),
+            },
             "prime": int(qimc_prime),
             "index": int(qimc_index)
         },
@@ -1563,6 +1880,8 @@ def route_query_to_manifold(text: str, include_eigenvalues: bool = False, mac: s
             "delta": float(hopf_data["coordinates"]["delta"]),
             "alpha": float(hopf_data["coordinates"]["alpha"]),
             "transported_alpha": float(hopf_data["coordinates"]["transported_alpha"]),
+            "phase_transport_lambda": float(phase_transport_lambda),
+            "hopf_chi_bins": int(uor_control["hopf_chi_bins"]),
             "sector_id": int(hopf_data["sector_id"]),
             "subspace_norms": {
                 "act": w_act,
@@ -1571,33 +1890,47 @@ def route_query_to_manifold(text: str, include_eigenvalues: bool = False, mac: s
                 "shared": w_shared
             }
         },
-        "uof_hash": best_uof_hash
+        "uor_address": best_uor_address,
+        "uor": uor_attestation,
+        "uor_payload": uor_payload
     }
     
     all_routes = []
-    for idx, win, state_slice, norm, y in candidates:
+    for idx, win, state_slice, norm, y, score in candidates:
         if idx == best_idx:
             all_routes.append({
                 "window_index": idx + 1,
                 "scale_x": float(win["x"]),
+                "routing_score": float(score),
                 "kappa": best_metrics["kappa"],
                 "deficit_angle": best_metrics["deficit_angle"],
                 "state_vector": state_slice.tolist(),
                 "active_range": [int(win["s_idx"]), int(win["e_idx"])],
                 "qimc": routed_result["qimc"],
                 "hopf": routed_result["hopf"],
-                "uof_hash": best_uof_hash
+                "uor_address": best_uor_address,
+                "uor": routed_result["uor"]
             })
         else:
             all_routes.append({
                 "window_index": idx + 1,
                 "scale_x": float(win["x"]),
+                "routing_score": float(score),
                 "kappa": 0.0,
                 "deficit_angle": math.pi,
                 "state_vector": state_slice.tolist(),
                 "active_range": [int(win["s_idx"]), int(win["e_idx"])],
                 "qimc": {
-                    "mac": normalize_mac(mac),
+                    "identity": identity_meta["identity"],
+                    "identity_type": identity_meta["identity_type"],
+                    "identity_uor_address": identity_meta["identity_uor_address"],
+                    "identity_uor_digest": identity_meta["identity_uor_digest"],
+                    "identity_uor_hash_algorithm": identity_meta["identity_uor_hash_algorithm"],
+                    "identity_uor_multihash": identity_meta["identity_uor_multihash"],
+                    "uor_control": {
+                        "entropy_bias": float(uor_control["entropy_bias"]),
+                        "hopf_chi_bins": int(uor_control["hopf_chi_bins"]),
+                    },
                     "prime": 0,
                     "index": 0
                 },
@@ -1616,7 +1949,15 @@ def route_query_to_manifold(text: str, include_eigenvalues: bool = False, mac: s
                         "shared": 0.0
                     }
                 },
-                "uof_hash": ""
+                "uor_address": "",
+                "uor": {
+                    "algorithm": "sha256",
+                    "address": "",
+                    "kappa_label": "",
+                    "fingerprint_hex": "",
+                    "verify_result": "",
+                },
+                "uor_payload": {}
             })
             
     return {
@@ -1816,15 +2157,17 @@ def ollama_generate(prompt: str, context_sentences: list[str], window_idx: int,
         return None
 
 
-def generate_response_from_metrics(text: str, routing_data: dict, api_key: str = None, max_tokens: int = 25, temperature: float = 0.7, mac="00:00:00:00:00:00", engine="geometric", gamma=0.5) -> dict:
-    global SESSION_BRAIN_STATE
+def generate_response_from_metrics(text: str, routing_data: dict, api_key: str = None, max_tokens: int = 25, temperature: float = 0.7, identity: str = "", engine="geometric", gamma=0.5, state_vector: np.ndarray = None) -> dict:
+    if not identity:
+        raise ValueError("identity is required")
+    active_state = np.copy(state_vector) if state_vector is not None else np.copy(get_brain_state(identity))
     best = routing_data["routed"]
     idx  = best["window_index"]
     m    = best["metrics"]
     evals = best["eigenvalues"]
 
     # 1. Retrieve top resonant corpus sentences using evolved brain state
-    raw_resonances = retrieve_geometric_resonance(text, routing_data, top_n=5, state_vector=SESSION_BRAIN_STATE)
+    raw_resonances = retrieve_geometric_resonance(text, routing_data, top_n=5, state_vector=active_state, identity=identity)
     context_sentences = [r[0] for r in raw_resonances]
 
     # 2. Determine voice/generation mode and generate
@@ -1840,12 +2183,12 @@ def generate_response_from_metrics(text: str, routing_data: dict, api_key: str =
 
     # 3. Build trajectory using evolved brain state (and generate text)
     geom_text, trajectory, S_final = generate_geometric_response_with_trajectory(
-        text, SESSION_BRAIN_STATE, max_len=max_tokens, temp=temperature, mac=mac, gamma=gamma
+        text, active_state, max_len=max_tokens, temp=temperature, identity=identity, gamma=gamma
     )
 
     if engine == "geometric":
         description = geom_text
-        SESSION_BRAIN_STATE = S_final
+        set_brain_state(identity, S_final)
     else:
         if ollama_res:
             description = ollama_res
@@ -1914,7 +2257,9 @@ def generate_response_from_metrics(text: str, routing_data: dict, api_key: str =
             "top_eigenvalue_pct": primary_eval_pct,
             "qimc":               best.get("qimc"),
             "hopf":               best.get("hopf"),
-            "uof_hash":           best.get("uof_hash"),
+            "uor_address":        best.get("uor_address", ""),
+            "uor":                best.get("uor", {}),
+            "uor_payload":        best.get("uor_payload", {}),
         },
         "eigenvalues":   evals,
         "active_range":  best["active_range"],
@@ -1932,6 +2277,15 @@ class RouterAPIHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         # Silence normal server console spam for asset queries
         pass
+
+    def _read_json_body(self):
+        content_length = int(self.headers.get('Content-Length', '0'))
+        if content_length <= 0:
+            return {}
+        raw = self.rfile.read(content_length)
+        if not raw:
+            return {}
+        return json.loads(raw.decode('utf-8'))
 
     def do_GET(self):
         if self.path == "/" or self.path == "/index.html":
@@ -1953,6 +2307,26 @@ class RouterAPIHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps({"zeros": zeros, "x_grid": [float(x) for x in X_GRID]}).encode())
 
+        elif self.path == "/api/uor/capabilities":
+            _record_request("/api/uor/capabilities")
+            capabilities = {
+                "content_codec": "json",
+                "supported_hash_algorithms": [
+                    {
+                        "name": name,
+                        "id": int(SUPPORTED_UOR_HASH_ALGOS[name]),
+                    }
+                    for name in SUPPORTED_UOR_HASH_ORDER
+                ],
+                "default_hash_algorithm": "sha256",
+                "witness_supported": True,
+            }
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps(capabilities).encode("utf-8"))
+
         elif self.path == "/api/sysinfo":
             _record_request("/api/sysinfo")
             uptime = time.time() - _SERVER_START_TIME
@@ -1964,7 +2338,10 @@ class RouterAPIHandler(BaseHTTPRequestHandler):
                 cats = _SERVER_STATS["catastrophes"]
             info = {
                 "uptime_seconds": round(uptime, 1),
-                "sentences_indexed": sum(len(v) for v in CORPUS_INDEX.values()),
+                "sentences_indexed": aggregate_indexed_sentences(),
+                "sentences_indexed_shared": count_indexed_sentences(CORPUS_INDEX),
+                "identity_scopes": len(CORPUS_INDEX_BY_ID),
+                "session_states": len(SESSION_BRAIN_STATES),
                 "requests_total": req_total,
                 "catastrophes": cats,
                 "window_hits": wins,
@@ -2008,7 +2385,7 @@ class RouterAPIHandler(BaseHTTPRequestHandler):
                 "",
                 "# HELP r4_sentences_indexed Indexed corpus sentences",
                 "# TYPE r4_sentences_indexed gauge",
-                f"r4_sentences_indexed {sum(len(v) for v in CORPUS_INDEX.values())}",
+                f"r4_sentences_indexed {aggregate_indexed_sentences()}",
                 "",
                 "# HELP r4_catastrophe_total Catastrophe topology events",
                 "# TYPE r4_catastrophe_total counter",
@@ -2047,34 +2424,40 @@ class RouterAPIHandler(BaseHTTPRequestHandler):
             # Serve the full corpus point-cloud map for the semantic visualizer
             try:
                 map_data = []
-                for win_idx, items in CORPUS_INDEX.items():
-                    for item in items:
-                        u = item.get("u")
-                        v = item.get("v")
-                        if u is None or v is None:
-                            sv = item["state_vector"]
-                            if isinstance(sv, list):
-                                sv_np = np.array(sv)
-                            else:
-                                sv_np = sv
-                            u, v = get_sentence_projection(sv_np, int(win_idx))
-                            item["u"] = u
-                            item["v"] = v
-                        v_4d = item.get("v_4d")
-                        if v_4d is None:
-                            sv = item["state_vector"]
-                            sv_np = np.array(sv) if isinstance(sv, list) else sv
-                            v_4d = get_state_4d_projection(sv_np)
-                            item["v_4d"] = v_4d
-                        map_data.append({
-                            "sentence": item["sentence"][:120],
-                            "window_index": int(win_idx),
-                            "u": u,
-                            "v": v,
-                            "v_4d": v_4d,
-                            "kappa": float(item.get("kappa", 0.0)),
-                            "prime_product_mod": int(item.get("prime_product", 1)) % 10007
-                        })
+                scope_sources = [("shared", CORPUS_INDEX)]
+                for scope_key, scoped_index in CORPUS_INDEX_BY_ID.items():
+                    scope_sources.append((scope_key, scoped_index))
+
+                for scope_key, source_index in scope_sources:
+                    for win_idx, items in source_index.items():
+                        for item in items:
+                            u = item.get("u")
+                            v = item.get("v")
+                            if u is None or v is None:
+                                sv = item["state_vector"]
+                                if isinstance(sv, list):
+                                    sv_np = np.array(sv)
+                                else:
+                                    sv_np = sv
+                                u, v = get_sentence_projection(sv_np, int(win_idx))
+                                item["u"] = u
+                                item["v"] = v
+                            v_4d = item.get("v_4d")
+                            if v_4d is None:
+                                sv = item["state_vector"]
+                                sv_np = np.array(sv) if isinstance(sv, list) else sv
+                                v_4d = get_state_4d_projection(sv_np)
+                                item["v_4d"] = v_4d
+                            map_data.append({
+                                "sentence": item["sentence"][:120],
+                                "window_index": int(win_idx),
+                                "u": u,
+                                "v": v,
+                                "v_4d": v_4d,
+                                "scope": scope_key,
+                                "kappa": float(item.get("kappa", 0.0)),
+                                "prime_product_mod": int(item.get("prime_product", 1)) % 10007
+                            })
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Access-Control-Allow-Origin", "*")
@@ -2091,28 +2474,34 @@ class RouterAPIHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path == "/api/chat":
             _record_request("/api/chat")
-            content_length = int(self.headers['Content-Length'])
-            post_data = self.rfile.read(content_length)
             
             try:
-                payload = json.loads(post_data.decode('utf-8'))
+                payload = self._read_json_body()
                 text = payload.get("text", "").strip()
-                mac = payload.get("mac", "00:00:00:00:00:00").strip()
+                identity = str(payload.get("identity", "")).strip()
+                if not identity:
+                    self.send_response(400)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"error": "identity is required"}).encode('utf-8'))
+                    return
+                active_state = get_brain_state(identity)
 
                 # 1. Dynamically compute self-balanced parameters (gamma, temp, engine, tokens)
                 # First route the current state to read active manifold metrics
-                dry_routing = route_query_to_manifold(text, include_eigenvalues=True, mac=mac, state_vector=SESSION_BRAIN_STATE)
+                dry_routing = route_query_to_manifold(text, include_eigenvalues=True, identity=identity, state_vector=active_state)
                 best_win = dry_routing["routed"]
                 kappa = float(best_win["metrics"]["kappa"])
                 theta_d = float(best_win["metrics"]["deficit_angle"])
                 evals = best_win.get("eigenvalues", [0.0] * 8)
                 eval_sum = sum(evals)
+                uor_bias = float(best_win.get("qimc", {}).get("uor_control", {}).get("entropy_bias", 0.5))
 
                 # State Decay (gamma) balances memory vs new input based on energy
-                gamma = round(max(0.15, min(0.90, 0.85 - 0.55 * kappa)), 2)
+                gamma = round(max(0.15, min(0.90, 0.85 - 0.55 * kappa + ((uor_bias - 0.5) * 0.12))), 2)
 
                 # Temperature balances creativity vs focus based on curvature
-                temperature = round(max(0.15, min(1.1, 0.2 + 0.8 * math.tanh(abs(theta_d)))), 2)
+                temperature = round(max(0.15, min(1.1, 0.2 + 0.8 * math.tanh(abs(theta_d)) + ((uor_bias - 0.5) * 0.20))), 2)
 
                 # Compute stratum from state slice (number of active resonant nodes on the manifold)
                 state_slice = np.array(best_win["state_vector"])
@@ -2126,6 +2515,7 @@ class RouterAPIHandler(BaseHTTPRequestHandler):
                 # - Influenced by input query length (longer prompt gets longer response)
                 input_words = len(text.split())
                 max_tokens = int(50 + (stratum * 1.5) + (abs(theta_d) * 45) + (eval_sum * 110) + (input_words * 2.5))
+                max_tokens += int((uor_bias - 0.5) * 80)
                 
                 # Keep it bounded in a rich dynamic range (e.g. 50 to 500 tokens)
                 max_tokens = max(50, min(500, max_tokens))
@@ -2144,17 +2534,26 @@ class RouterAPIHandler(BaseHTTPRequestHandler):
                         engine = "geometric"
 
                 # 2. Evolve the persistent brain state vector using the user prompt
-                evolve_brain_state(text, gamma=gamma)
+                active_state = evolve_brain_state(text, gamma=gamma, identity=identity)
 
                 # 3. Run the R4 routing evaluation on the evolved brain state (timed)
                 t0 = time.time()
-                routing_data = route_query_to_manifold(text, include_eigenvalues=True, mac=mac, state_vector=SESSION_BRAIN_STATE)
+                routing_data = route_query_to_manifold(text, include_eigenvalues=True, identity=identity, state_vector=active_state)
                 route_ms = (time.time() - t0) * 1000
                 _record_routing_latency(route_ms, routing_data["routed"]["window_index"])
 
                 # 4. Decode the metrics into the "voice" of the model (timed)
                 t1 = time.time()
-                response = generate_response_from_metrics(text, routing_data, max_tokens=max_tokens, temperature=temperature, mac=mac, engine=engine, gamma=gamma)
+                response = generate_response_from_metrics(
+                    text,
+                    routing_data,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    identity=identity,
+                    engine=engine,
+                    gamma=gamma,
+                    state_vector=active_state,
+                )
                 gen_ms = (time.time() - t1) * 1000
                 _record_gen_latency(gen_ms)
                 response["routing_latency_ms"] = round(route_ms, 2)
@@ -2165,14 +2564,15 @@ class RouterAPIHandler(BaseHTTPRequestHandler):
                     "gamma": gamma,
                     "temperature": temperature,
                     "max_tokens": max_tokens,
-                    "engine": engine
+                    "engine": engine,
+                    "uor_entropy_bias": uor_bias,
                 }
 
                 # 4. Dynamically weave the user prompt and response back into the manifold corpus
                 if response.get("description"):
                     try:
-                        index_single_sentence(text)
-                        index_single_sentence(response["description"])
+                        index_single_sentence(text, identity=identity)
+                        index_single_sentence(response["description"], identity=identity)
                         # Save the updated manifold cache to disk in a background daemon thread to prevent blocking
                         import threading
                         threading.Thread(target=save_manifold_cache, args=(CACHE_FILE,), daemon=True).start()
@@ -2237,23 +2637,34 @@ class RouterAPIHandler(BaseHTTPRequestHandler):
         elif self.path == "/api/reset":
             _record_request("/api/reset")
             try:
-                reset_brain_state()
+                try:
+                    payload = self._read_json_body()
+                    identity = payload.get("identity")
+                except (json.JSONDecodeError, ValueError):
+                    identity = None
+
+                if identity is None:
+                    self.send_response(400)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"error": "identity is required"}).encode('utf-8'))
+                    return
+
+                reset_brain_state(identity=identity)
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
-                self.wfile.write(json.dumps({"success": True}).encode('utf-8'))
+                self.wfile.write(json.dumps({"success": True, "identity": identity}).encode('utf-8'))
             except Exception as e:
                 self.send_response(500)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
                 self.wfile.write(json.dumps({"error": str(e)}).encode('utf-8'))
         elif self.path == "/api/corpus":
-            content_length = int(self.headers['Content-Length'])
-            post_data = self.rfile.read(content_length)
-            
             try:
-                payload = json.loads(post_data.decode('utf-8'))
+                payload = self._read_json_body()
                 corpus = payload.get("corpus", "").strip()
                 
                 count = index_corpus(corpus)
@@ -2263,6 +2674,66 @@ class RouterAPIHandler(BaseHTTPRequestHandler):
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
                 self.wfile.write(json.dumps({"success": True, "count": count}).encode('utf-8'))
+            except Exception as e:
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": str(e)}).encode('utf-8'))
+        elif self.path == "/api/uor/verify":
+            _record_request("/api/uor/verify")
+            try:
+                payload = self._read_json_body()
+                supplied_address = str(payload.get("address", "")).strip()
+                canonical_payload = payload.get("payload", {})
+                requested_hash = payload.get("hash_algorithm")
+                if not requested_hash and ":" in supplied_address:
+                    requested_hash = supplied_address.split(":", 1)[0]
+                attestation = generate_uor_attestation(canonical_payload, hash_algorithm=requested_hash or "sha256", include_multihash=True)
+                recomputed = attestation.get("address", "")
+                multihash = attestation.get("multihash_addresses", {})
+                matched_algo = ""
+                if supplied_address:
+                    for algo_name, addr in multihash.items():
+                        if supplied_address == addr:
+                            matched_algo = algo_name
+                            break
+                matched = bool(supplied_address) and bool(matched_algo)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(json.dumps({
+                    "verified": matched,
+                    "matched_hash_algorithm": matched_algo,
+                    "supplied_address": supplied_address,
+                    "recomputed_address": recomputed,
+                    "uor": attestation,
+                }).encode('utf-8'))
+            except Exception as e:
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": str(e)}).encode('utf-8'))
+        elif self.path == "/api/uor/attest":
+            _record_request("/api/uor/attest")
+            try:
+                payload = self._read_json_body()
+                canonical_payload = payload.get("payload", {})
+                requested_hash = payload.get("hash_algorithm", "sha256")
+                include_multihash = bool(payload.get("include_multihash", True))
+                attestation = generate_uor_attestation(
+                    canonical_payload,
+                    hash_algorithm=requested_hash,
+                    include_multihash=include_multihash,
+                )
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(json.dumps({
+                    "uor": attestation,
+                    "payload": canonical_payload,
+                }).encode('utf-8'))
             except Exception as e:
                 self.send_response(500)
                 self.send_header("Content-Type", "application/json")
@@ -2378,7 +2849,7 @@ def index_extra_reading_files():
         indexed_count = 0
         for s in new_sentences:
             try:
-                routing_data = route_query_to_manifold(s)
+                routing_data = route_query_to_manifold(s, identity=RESERVED_SHARED_IDENTITY)
                 best = routing_data["routed"]
                 idx_win = best["window_index"]
                 
@@ -2413,7 +2884,7 @@ def index_extra_reading_files():
     else:
         print("[+] All extra_reading and DEFAULT_CORPUS files are already indexed.")
 
-def index_single_sentence(s: str):
+def index_single_sentence(s: str, identity: str | None = None):
     """
     Dynamically indexes a single sentence onto the R4 manifold CORPUS_INDEX.
     Extends vocabulary and WORD_PRIMES if new words are encountered.
@@ -2437,7 +2908,7 @@ def index_single_sentence(s: str):
         build_vocab_matrix()
         
     # 2. Route the sentence to find its window and state vector
-    routing_data = route_query_to_manifold(s_clean)
+    routing_data = route_query_to_manifold(s_clean, identity=identity)
     best = routing_data["routed"]
     idx_win = best["window_index"]
     s_idx, e_idx = best["active_range"]
@@ -2445,18 +2916,20 @@ def index_single_sentence(s: str):
     full_state = np.zeros(M_MAX)
     full_state[s_idx:e_idx] = np.array(best["state_vector"])
     
-    if idx_win not in CORPUS_INDEX:
-        CORPUS_INDEX[idx_win] = []
+    target_index = get_corpus_index_for_identity(identity)
+
+    if idx_win not in target_index:
+        target_index[idx_win] = []
         
     # Avoid duplicate indexing of the same sentence
-    for item in CORPUS_INDEX[idx_win]:
+    for item in target_index[idx_win]:
         if item["sentence"].strip().lower() == s_clean.lower():
             return
             
     u, v = get_sentence_projection(full_state, idx_win)
     v_4d = get_state_4d_projection(full_state)
     
-    CORPUS_INDEX[idx_win].append({
+    target_index[idx_win].append({
         "sentence": s_clean,
         "state_vector": full_state,
         "kappa": best["metrics"]["kappa"],
@@ -2468,7 +2941,10 @@ def index_single_sentence(s: str):
         "v_4d": v_4d
     })
     
-    # 3. Incrementally update transition tables for words in this sentence
+    # 3. Incrementally update transition tables only for shared/global corpus
+    if identity is not None:
+        return
+
     for i in range(len(words) - 1):
         w1, w2 = words[i], words[i+1]
         if w1 not in TRANSITIONS:

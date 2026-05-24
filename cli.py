@@ -1,10 +1,7 @@
 import os
 import sys
-import json
 import math
-import numpy as np
 import time
-import random
 
 # Suppress debug output from server
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -18,6 +15,10 @@ def main():
     print("[*] Booting mathematical manifold...")
 
     server.load_manifold_cache("manifold_cache.json")
+
+    identity = ""
+    while not identity:
+        identity = input("Identity (UOR address or text label): ").strip()
 
     print("[+] Core geometry initialized and ready.")
     print("Type 'exit' or 'quit' to terminate.")
@@ -38,14 +39,11 @@ def main():
             content_words = [w for w in query_words if w not in server.QUERY_STOPWORDS]
             filtered_input = " ".join(content_words) if content_words else user_input
 
-            # Calculate S for steering
-            S = np.zeros(server.M_MAX)
-            for w in query_words:
-                if w in server.VOCAB_VECTORS:
-                    S += server.VOCAB_VECTORS[w]
+            # Evolve identity-scoped state before routing/generation
+            S = server.evolve_brain_state(filtered_input, gamma=0.5, identity=identity)
 
             # 1. Route query to R4 Manifold
-            routing_data = server.route_query_to_manifold(filtered_input)
+            routing_data = server.route_query_to_manifold(filtered_input, identity=identity, state_vector=S)
             best_route = routing_data["routed"]
             win_idx = best_route["window_index"]
             metrics = best_route["metrics"]
@@ -54,7 +52,7 @@ def main():
             description, trajectory, _ = server.generate_geometric_response_with_trajectory(
                 filtered_input, S,
                 max_len=30,
-                mac="00:1a:2b:3c:4d:5e"
+                identity=identity
             )
 
             elapsed = time.time() - start_time

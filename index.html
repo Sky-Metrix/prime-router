@@ -142,12 +142,12 @@
         }
         .slider::-webkit-slider-thumb:hover { box-shadow: 0 0 16px var(--cyan); }
 
-        .mac-label {
+        .identity-label {
             font-size: 0.72rem;
             color: var(--text2);
             margin-bottom: 0.3rem;
         }
-        .mac-input {
+        .identity-input {
             width: 100%;
             background: rgba(255,255,255,0.04);
             border: 1px solid var(--border2);
@@ -159,7 +159,7 @@
             outline: none;
             transition: border-color 0.2s;
         }
-        .mac-input:focus { border-color: var(--cyan); }
+        .identity-input:focus { border-color: var(--cyan); }
 
         /* KB Textarea */
         .kb-textarea {
@@ -947,8 +947,8 @@
                 <span>↳ Tuned by Ollama availability</span>
             </div>
 
-            <div class="mac-label">QIMC MAC Address</div>
-            <input type="text" class="mac-input" id="macInput" placeholder="00:1A:2B:3C:4D:5E" value="00:1a:2b:3c:4d:5e" style="margin-bottom:0.75rem;">
+            <div class="identity-label">Routing Identity (UOR, address, or text)</div>
+            <input type="text" class="identity-input" id="identityInput" placeholder="sha256:... or tenant-alpha" style="margin-bottom:0.75rem;">
         </div>
 
         <!-- QIMC Panel -->
@@ -957,7 +957,13 @@
             <div class="qimc-panel">
                 <div class="qimc-row"><span class="qimc-key">Prime</span><span class="qimc-val" id="qimcPrime">—</span></div>
                 <div class="qimc-row"><span class="qimc-key">Index</span><span class="qimc-val" id="qimcIndex">—</span></div>
-                <div class="qimc-row"><span class="qimc-key">UOF Hash</span><span class="qimc-val" id="uofHash" style="font-size:0.55rem; color:var(--text2);">—</span></div>
+                <div class="qimc-row"><span class="qimc-key">Identity</span><span class="qimc-val" id="qimcIdentity" style="font-size:0.62rem; color:var(--text2);">—</span></div>
+                <div class="qimc-row"><span class="qimc-key">Identity UOR</span><span class="qimc-val" id="qimcIdentityUor" style="font-size:0.55rem; color:var(--text2);">—</span></div>
+                <div class="qimc-row"><span class="qimc-key">Identity Digest</span><span class="qimc-val" id="qimcIdentityDigest" style="font-size:0.55rem; color:var(--text2);">—</span></div>
+                <div class="qimc-row"><span class="qimc-key">UOR Address</span><span class="qimc-val" id="uorAddress" style="font-size:0.55rem; color:var(--text2);">—</span></div>
+                <div class="qimc-row"><span class="qimc-key">UOR Verify</span><span class="qimc-val" id="uorVerify" style="color:var(--amber);">—</span></div>
+                <div class="qimc-row"><span class="qimc-key">UOR Label</span><span class="qimc-val" id="uorLabel" style="font-size:0.62rem; color:var(--text2);">—</span></div>
+                <div class="qimc-row"><span class="qimc-key">UOR Fingerprint</span><span class="qimc-val" id="uorFingerprint" style="font-size:0.55rem; color:var(--text2);">—</span></div>
                 <div class="qimc-row"><span class="qimc-key">Monodromy</span><span class="qimc-val" id="monoLabel" style="color:var(--amber);">r^0</span></div>
             </div>
         </div>
@@ -1927,13 +1933,61 @@ function updateTelemetry(data) {
     document.getElementById("telemetryRoute").textContent = m.window_index ? `Window ${m.window_index}` : "—";
     document.getElementById("mapActiveWin").textContent   = m.window_index || "—";
 
-    // QIMC + UOF
+    // QIMC + UOR
     if (m.qimc) {
         document.getElementById("qimcPrime").textContent = m.qimc.prime || "—";
         document.getElementById("qimcIndex").textContent = m.qimc.index || "—";
+        const identityText = `${m.qimc.identity_type || "unknown"}: ${(m.qimc.identity || "").slice(0,20)}${(m.qimc.identity || "").length > 20 ? "..." : ""}`;
+        document.getElementById("qimcIdentity").textContent = (m.qimc.identity || "") ? identityText : "—";
+        document.getElementById("qimcIdentityUor").textContent = m.qimc.identity_uor_address ? `${m.qimc.identity_uor_address.slice(0,32)}...` : "—";
+        document.getElementById("qimcIdentityDigest").textContent = m.qimc.identity_uor_digest ? `${m.qimc.identity_uor_digest.slice(0,24)}...` : "—";
     }
-    if (m.uof_hash) {
-        document.getElementById("uofHash").textContent = m.uof_hash.slice(0,32) + "...";
+    if (m.uor_address) {
+        document.getElementById("uorAddress").textContent = m.uor_address.slice(0,32) + "...";
+    }
+    if (m.uor) {
+        const verifyEl = document.getElementById("uorVerify");
+        const verifyRaw = (m.uor.verify_result || "").toLowerCase();
+        if (verifyEl) {
+            if (verifyRaw.includes("ok") || verifyRaw.includes("valid") || verifyRaw === "true") {
+                verifyEl.textContent = "Verified";
+                verifyEl.style.color = "var(--emerald)";
+            } else if (verifyRaw === "witness-unavailable") {
+                verifyEl.textContent = "Witness Unavailable";
+                verifyEl.style.color = "var(--amber)";
+            } else if (m.uor.address) {
+                verifyEl.textContent = m.uor.verify_result || "Unavailable";
+                verifyEl.style.color = "var(--amber)";
+            } else {
+                verifyEl.textContent = "Unavailable";
+                verifyEl.style.color = "var(--red)";
+            }
+        }
+        document.getElementById("uorLabel").textContent = m.uor.kappa_label || "—";
+        if (m.uor.fingerprint_hex) {
+            document.getElementById("uorFingerprint").textContent = m.uor.fingerprint_hex.slice(0,28) + "...";
+        }
+
+        // Independent API-side verification against canonical payload
+        if (m.uor_payload && m.uor_address) {
+            fetch("/api/uor/verify", {
+                method: "POST",
+                headers: {"Content-Type":"application/json"},
+                body: JSON.stringify({ payload: m.uor_payload, address: m.uor_address })
+            })
+            .then(r => r.json())
+            .then(v => {
+                if (!verifyEl) return;
+                if (v && v.verified) {
+                    verifyEl.textContent = "Verified (API)";
+                    verifyEl.style.color = "var(--emerald)";
+                } else if (v && v.recomputed_address) {
+                    verifyEl.textContent = "Mismatch";
+                    verifyEl.style.color = "var(--red)";
+                }
+            })
+            .catch(() => {});
+        }
     }
 
     // Hopf subspace norms
@@ -2201,14 +2255,22 @@ async function sendQuery(text) {
     chatLogInner.appendChild(loadMsg);
     scrollToBottom();
 
-    const mac = document.getElementById("macInput")?.value.trim() || "00:1a:2b:3c:4d:5e";
+    const identity = document.getElementById("identityInput")?.value.trim() || "";
+    if (!identity) {
+        chatLogInner.removeChild(loadMsg);
+        addMessage("model", "Identity is required.");
+        chatInput.disabled = false;
+        sendBtn.disabled = false;
+        chatInput.focus();
+        return;
+    }
     try {
         const resp = await fetch("/api/chat", {
             method: "POST",
             headers: {"Content-Type":"application/json"},
             body: JSON.stringify({ 
                 text, 
-                mac
+                identity
             })
         });
         const data = await resp.json();
