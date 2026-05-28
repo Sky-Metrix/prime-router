@@ -130,7 +130,7 @@ A Levi-Civita correction is applied to execute phase transport, correcting for t
 
 ### **The 2i Sync-Handshake Protocol**
 
-To facilitate global observability while maintaining the conservation of semantic flux, the router utilizes a Zero-Knowledge Handshake situated at Layer 21 of the execution stack. This protocol allows an external observer to validate that an agent's path aligns with the root of trust (the W3 SHA1) without exposing the internal parameters of the underlying model.
+To facilitate global observability while maintaining the conservation of semantic flux, the router utilizes a Zero-Knowledge Handshake situated at Layer 2i of the execution stack. This protocol allows an external observer to validate that an agent's path aligns with the root of trust (the W3 SHA1) without exposing the internal parameters of the underlying model.
 
  Node (Proves Trajectory)                    Observer (Validates)  
   |                                                                         |  
@@ -145,7 +145,7 @@ This verification process unfolds across five distinct operational phases:
 | Handshake Phase | Operational Task | Mathematical Anchor |
 | :---- | :---- | :---- |
 | **I: Initialization** | Establish the W3 Seal as the absolute root of trust. | set (Category Theory)   |
-| **II: Translation** | Map continuous complex emissions to the Riemannian surface. | ![][image80] 21 Bridge  |
+| **II: Translation** | Map continuous complex emissions to the Riemannian surface. | ![][image80] 2i Bridge  |
 | **III: Projection** | Emit a 2D shadow of the ![][image81] tangent movement. | Hopf Fibration (![][image82])  |
 | **IV: Validation** | Verify the conservation of semantic flux. | Hamiltonian Mechanics  |
 | **V: Finality** | Trigger a hard operational halt upon topological saturation. | Contraction Mapping Theorem  |
